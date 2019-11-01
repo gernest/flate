@@ -8,12 +8,24 @@ const table_shift: usize = 32 - table_bits; // Right-shift to get the tableBits 
 const input_margin = 16 - 1;
 const min_non_literal_block_size = 1 + 1 + input_margin;
 const max_store_block_size: usize = 65535;
+
+// The LZ77 step produces a sequence of literal tokens and <length, offset>
+// pair tokens. The offset is also known as distance. The underlying wire
+// format limits the range of lengths and offsets. For example, there are
+// 256 legitimate lengths: those in the range [3, 258]. This package's
+// compressor uses a higher minimum match length, enabling optimizations
+// such as finding matches via 32-bit loads and compares.
+const base_match_length: usize = 3; // The smallest match length per the RFC section 3.2.5
 const max_match_offset: usize = 1 << 15;
-const max_match_length: usize = 258;
+const max_match_length: usize = 258; // The largest match length
+const base_match_offset: usize = 1; // The smallest match offset
+const min_match_Length: usize = 4; // The smallest match length that the compressor actually emits
+
 const literal_type: u32 = 0 << 30;
 const imput_margin = 16 - 1;
 const min_non_literal_block_size = 1 + 1 + input_margin;
-
+const match_type: u32 = 1 << 30;
+const length_shift = 32;
 pub const Fast = struct {
     table: [table_size]TableEntry = [_]TableEntry{TableEntry{}} ** table_size,
     prev: []u8 = blk: {
@@ -50,6 +62,10 @@ pub const Fast = struct {
 
     fn literalToken(lit: u32) u32 {
         return literal_type + lit;
+    }
+
+    fn matchToken(xlength: u32, xoffset: u32) u32 {
+        return match_type + xlength << length_shift + xoffset;
     }
 
     fn emitLiteral(dst: *std.ArrayList(u32), src: []const u8) !void {
@@ -109,6 +125,63 @@ pub const Fast = struct {
                     std.mem.copy(u8, self.prev, src);
                     return;
                 }
+                const x = @intCast(usize, next_hash) & table_mask;
+                candidate = self.table[x];
+                var now = load32(src);
+                self.table[x] = TableEntry{
+                    .offset = s + self.cur,
+                    .val = cv,
+                };
+                next_hash = hash(now);
+                const offset = s - (candidate.offset - self.cur);
+                if (offset > max_match_offset or cv != candidate.val) {
+                    cv = now;
+                    continue;
+                }
+                break;
+            }
+            // A 4-byte match has been found. We'll later see if more than 4 bytes
+            // match. But, prior to the match, src[nextEmit:s] are unmatched. Emit
+            // them as literal bytes.
+            try emitLiteral(dst, src[next_emit..s]);
+
+            // Call emitCopy, and then see if another emitCopy could be our next
+            // move. Repeat until we find no match for the input immediately after
+            // what was consumed by the last emitCopy call.
+            //
+            // If we exit this loop normally then we need to call emitLiteral next,
+            // though we don't yet know how big the literal will be. We handle that
+            // by proceeding to the next iteration of the main loop. We also can
+            // exit this loop via goto if we get close to exhausting the input.
+            while (true) {
+                // Invariant: we have a 4-byte match at s, and no need to emit any
+                // literal bytes prior to s.
+
+                // Extend the 4-byte match as long as possible.
+                s += 4;
+                const t = @intCast(isize, candidate.offset) - @intCast(isize, e.cur) + 4;
+                const l = self.matchLen(s, t, src);
+                try dst.append(matchToken(
+                    @intCast(u32, l + 4 + base_match_length),
+                    @intCast(u32, @intCast(isize, s) - t - @intCast(isize, base_match_offset)),
+                ));
+                s += l;
+                next_emit = s;
+                if (s >= s_limit) {
+                    if (next_emit < src.len) {
+                        try emitLiteral(dst, src[next_emit..]);
+                    }
+                    self.cur += src.len;
+                    self.prev_len = src.len;
+                    std.mem.copy(u8, self.prev, src);
+                    return;
+                }
+                // We could immediately start working at s now, but to improve
+                // compression we first update the hash table at s-1 and at s. If
+                // another emitCopy is not our next move, also calculate nextHash
+                // at s+1. At least on GOARCH=amd64, these three hash calculations
+                // are faster as one load64 call (with some shifts) instead of
+                // three load32 calls.
             }
         }
     }
