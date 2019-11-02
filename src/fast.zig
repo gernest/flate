@@ -182,6 +182,26 @@ pub const Fast = struct {
                 // at s+1. At least on GOARCH=amd64, these three hash calculations
                 // are faster as one load64 call (with some shifts) instead of
                 // three load32 calls.
+                var x = load64(src);
+                const prev_hash = hash(@intCast(u32, x));
+                self.table[prev_hash & table_mask] = TableEntry{
+                    .offset = self.cur + s - 1,
+                    .val = @intCast(u32, x),
+                };
+                x >>= 8;
+                const curr_hash = hash(@intCast(u32, x));
+                candidate = self.table[curr_hash & table_mask];
+                self.table[curr_hash & table_mask] = TableEntry{
+                    .offset = self.cur + s,
+                    .val = @intCast(u32, x),
+                };
+                const offset = s - @intCast(usize, candidate.offset - self.cur);
+                if (offset > max_match_offset or @intCast(u32, x) != candidate.val) {
+                    cv = @intCast(u32, x >> 8);
+                    next_hash = hash(cv);
+                    s += 1;
+                    break;
+                }
             }
         }
     }
