@@ -4,6 +4,7 @@ const math = std.math;
 const assert = std.debug.assert;
 const warn = std.debug.warn;
 const Allocator = std.mem.Allocator;
+const io = std.io;
 
 pub const max_num_lit = 286;
 pub const max_bits_limit = 16;
@@ -304,4 +305,108 @@ test "huffman" {
     for (h.codes[0..h.codes_len]) |code| {
         warn("{}, {}\n", code.code, code.len);
     }
+}
+
+const offset_code_count = 30;
+
+// The special code used to mark the end of a block.
+const end_block_marker = 256;
+
+// The first length code.
+const length_codes_start = 257;
+
+// The number of codegen codes.
+const codegen_code_count = 19;
+const bad_code = 255;
+
+// buffer_flush_size indicates the buffer size
+// after which bytes are flushed to the writer.
+// Should preferably be a multiple of 6, since
+// we accumulate 6 bytes between writes to the buffer.
+const buffer_flush_size = 240;
+
+// buffer_size is the actual output byte buffer size.
+// It must have additional headroom for a flush
+// which can contain up to 8 bytes.
+const buffer_size = buffer_flush_size + 8;
+
+//zig fmt: off
+const length_extra_bits = [_]u8{
+     0, 0, 0, //257
+     0, 0, 0, 0, 0, 1, 1, 1, 1, 2,// 260
+     2, 2, 2, 3, 3, 3, 3, 4, 4, 4, //270
+     4, 5, 5, 5, 5, 0, //280
+};
+//zig fmt: on
+const length_base = [_]u32{
+    0,  1,  2,  3,   4,   5,   6,   7,   8,   10,
+    12, 14, 16, 20,  24,  28,  32,  40,  48,  56,
+    64, 80, 96, 112, 128, 160, 192, 224, 255,
+};
+const offset_extra_bits = [_]u8{
+    0, 0, 0,  0,  1,  1,  2,  2,  3,  3,
+    4, 4, 5,  5,  6,  6,  7,  7,  8,  8,
+    9, 9, 10, 10, 11, 11, 12, 12, 13, 13,
+};
+const offset_base = []u32{
+    0x000000, 0x000001, 0x000002, 0x000003, 0x000004,
+    0x000006, 0x000008, 0x00000c, 0x000010, 0x000018,
+    0x000020, 0x000030, 0x000040, 0x000060, 0x000080,
+    0x0000c0, 0x000100, 0x000180, 0x000200, 0x000300,
+    0x000400, 0x000600, 0x000800, 0x000c00, 0x001000,
+    0x001800, 0x002000, 0x003000, 0x004000, 0x006000,
+};
+const codegen_order = [_]u32{
+    16, 17, 18, 0,  8,  7,  9,
+    6,  10, 5,  11, 4,  12, 3,
+    13, 2,  14, 1,  15,
+};
+
+const code_gen_size = max_num_lit + offset_code_count + 1;
+
+pub fn Writer(comptime Error: type) type {
+    return struct {
+        const Self = @This();
+        pub const Stream = io.OutStream(Error);
+
+        stream: Stream,
+        out_stream: *Stream,
+        bits: u64,
+        nbits: u8,
+        bytes: [buffer_size]u8 = []u8{0} ** buffer_size,
+        code_gen_freq: [codegen_code_count]u32 = []u32{0} ** codegen_code_count,
+        nbytes: usize,
+        literal_freq: [max_num_lit]i32 = []i32{0} ** max_num_lit,
+        offset_freq: []i32 = []i32 ** offset_code_count,
+        code_gen: [code_gen_size]u8 = []u8{0} ** code_gen_size,
+        literal_encoding: Huffman = Huffman.init(max_num_lit),
+        offset_encoding: Huffman = Huffman.init(codegen_code_count),
+        code_gen_encoding: Huffman = Huffman.init(offset_code_count),
+
+        fn writeFn(out_stream: *Stream, bytes: []const u8) !void {
+            const self = @fieldParentPtr(Self, "stream", out_stream);
+            return self.write(bytes);
+        }
+
+        fn write(self: *Self, bytes: []const u8) !void {
+            try self.out_stream.write(bytes);
+        }
+
+        fn flush(sel: *Self) !void {
+            var n = self.nbytes;
+            while (self.nbits != 0) {
+                self.bytes[n] = @intCast(usize, self.bits);
+                self.bits >>= 8;
+                if (self.bits > 8) {
+                    self.nbits -= 8;
+                } else {
+                    self.nbits = 0;
+                }
+                n += 1;
+            }
+            self.bits = 0;
+            try self.write(self.bytes[0..n]);
+            self.nbytes = 0;
+        }
+    };
 }
