@@ -5,10 +5,36 @@ const assert = std.debug.assert;
 const warn = std.debug.warn;
 const Allocator = std.mem.Allocator;
 const io = std.io;
+const mem = std.mem;
 
 pub const max_num_lit = 286;
 pub const max_bits_limit = 16;
 const max_i32 = math.maxInt(i32);
+
+const log_window_size: usize = 15;
+const window_size: usize = 1 << log_window_size;
+const window_mask: usize = window_size - 1;
+
+// The LZ77 step produces a sequence of literal tokens and <length, offset>
+// pair tokens. The offset is also known as distance. The underlying wire
+// format limits the range of lengths and offsets. For example, there are
+// 256 legitimate lengths: those in the range [3, 258]. This package's
+// compressor uses a higher minimum match length, enabling optimizations
+// such as finding matches via 32-bit loads and compares.
+const base_match_length: usize = 3; // The smallest match length per the RFC section 3.2.5
+const min_match_length: usize = 4; // The smallest match length that the compressor actually emits
+const max_match_length: usize = 258; // The largest match length
+const base_match_offset: usize = 1; // The smallest match offset
+const max_match_offset: usize = 1 << 15; // The largest match offset
+
+// The maximum number of tokens we put into a single flate block, just to
+// stop things from getting too large.
+const max_flate_block_tokens: usize = 1 << 14;
+const max_store_block_size: usize = 65535;
+const hash_bits: usize = 17; // After 17 performance degrades
+const hash_size: usize = 1 << hash_bits;
+const hashMask: usize = (1 << hash_bits) - 1;
+const maxHash_offset: usize = 1 << 24;
 
 pub const Huffman = struct {
     codes: [max_num_lit]Code,
@@ -410,3 +436,53 @@ pub fn Writer(comptime Error: type) type {
         }
     };
 }
+
+// dictDecoder implements the LZ77 sliding dictionary as used in decompression.
+// LZ77 decompresses data through sequences of two forms of commands:
+//
+//  stream as is. This is accomplished through the writeByte method for a
+//  single symbol, or combinations of writeSlice/writeMark for multiple symbols.
+//  Any valid stream must start with a literal insertion if no preset dictionary
+//  is used.
+//
+//  * Backward copies: Runs of one or more symbols are copied from previously
+//  emitted data. Backward copies come as the tuple (dist, length) where dist
+//  determines how far back in the stream to copy from and length determines how
+//  many bytes to copy. Note that it is valid for the length to be greater than
+//  the distance. Since LZ77 uses forward copies, that situation is used to
+//  perform a form of run-length encoding on repeated runs of symbols.
+//  The writeCopy and tryWriteCopy are used to implement this command.
+//
+// For performance reasons, this implementation performs little to no sanity
+// checks about the arguments. As such, the invariants documented for each
+// method call must be respected.
+const DictDecoder = struct {
+    hist: []u8 = blk: {
+        var a: [max_match_offset]u8 = []u8{0} ** max_match_offset;
+        break a[0..];
+    },
+    w_pos: usize = 0,
+    r_pos: usize = 0,
+    full: bool = false,
+
+    fn init(dict: ?[]u8) DictDecoder {
+        var d = DictDecoder{};
+        if (dict != null and dict.?.len > 0) {
+            mem.copy(u8, d.hist, dict.?);
+        }
+        return d;
+    }
+
+    fn histSize(self: *DictDecoder) usize {
+        if (self.full) return self.hist.len;
+        return self.w_pos;
+    }
+
+    fn avaiRead(self: *DictDecoder) usize {
+        return self.w_pos - self.r_pos;
+    }
+
+    fn avaiWrite(self: *DictDecoder) usize {
+        return self.hist.len - self.w_pos;
+    }
+};
